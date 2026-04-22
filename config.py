@@ -18,6 +18,7 @@ class Config:
     target_entropy: float | None = None
 
     sac_batch_size: int = 64
+    sac_gradient_step: int = 1
 
 
     # World Model
@@ -36,9 +37,11 @@ class Config:
     # Train
     max_step: int = 100_000
     D_env_capacity: int = 1000_000
-    D_model_capacity: int = 1000_000
-    log_dir: str = "logs" # unused for now
-    save_dir: str = "checkpoints" # unused for now
+    D_model_capacity: int = 1000_000 
+    log_dir: str = "logs"
+    save_dir: str = "checkpoints"
+    checkpoint_interval: int = 10_000
+    resume_id: str | None = None
 
 
 # Requirements:
@@ -50,39 +53,42 @@ CONFIG: list[Config] = [
 
         # SAC
         actor_hidden_dim=256,
-        actor_num_hidden_layer=4,
+        actor_num_hidden_layer=2,
         critic_hidden_dim=256,
-        critic_num_hidden_layer=4,
+        critic_num_hidden_layer=2,
         
         actor_lr=3e-4,
-        critic_lr=3e-4,
+        critic_lr=3e-3,
         alpha_lr=3e-4,
         gamma=0.99,
         tau=0.005,
         target_entropy=None,
 
         sac_batch_size=256,
+        sac_gradient_step=4,
 
 
         # World Model
         wm_hidden_dim=256,
-        wm_num_hidden_layer=4,
+        wm_num_hidden_layer=3,
 
-        wm_lr=3e-4,
+        wm_lr=1e-3,
         
-        wm_rollout_interval=250,
+        wm_rollout_interval=5,
         wm_rollout_batch_size=256,
 
-        wm_train_interval=250,
+        wm_train_interval=1,
         wm_train_batch_size=256,
 
 
         # Train
-        max_step=100_000,
-        D_env_capacity=1000000,
-        D_model_capacity=1000000,
+        max_step=300_000,
+        D_env_capacity=1_000_000,
+        D_model_capacity=400_000,
         log_dir="logs",
         save_dir="checkpoints",
+        checkpoint_interval=10_000,
+        resume_id=None,
     )
 ]
 

@@ -3,18 +3,21 @@ import numpy as np
 import torch
 import gymnasium as gym
 import tyro
-from torch import from_numpy, tensor
+import datetime
+from torch import from_numpy
+from torch.utils.tensorboard import SummaryWriter
 
 from config import Config, CONFIG
 from model import Actor, SAC, WorldModel
 from replay_buffer import ReplayBuffer
+
 
 def eval_policy(env: gym.Env, actor: Actor, num_episode: int, device: torch.device) -> float:
     actor.eval()
     total_reward = 0.0
 
     for _ in range(num_episode):
-        obs, _ = env.reset()
+        obs, info = env.reset()
         done = False
 
         while not done:
@@ -35,13 +38,17 @@ def fuck(*args, device: torch.device):
 def main(cfg:Config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    os.makedirs(cfg.log_dir, exist_ok=True)
+    run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = os.path.join(cfg.log_dir, f'{cfg.env_name}-{run_id}')
+    os.makedirs(log_dir, exist_ok=True)
     os.makedirs(cfg.save_dir, exist_ok=True)
 
     env = gym.make(cfg.env_name)
     eval_env = gym.make(cfg.env_name)
     env = gym.wrappers.RescaleAction(env, -1.0, 1.0)
     eval_env = gym.wrappers.RescaleAction(eval_env, -1.0, 1.0)
+    env = gym.wrappers.TransformObservation(env, lambda obs: obs.astype(np.float32), env.observation_space)
+    eval_env = gym.wrappers.TransformObservation(eval_env, lambda obs: obs.astype(np.float32), eval_env.observation_space)
 
     assert isinstance(env.observation_space, gym.spaces.Box), "Only Box observation spaces are supported."
     assert isinstance(env.action_space, gym.spaces.Box), "Only Box action spaces are supported."
@@ -76,13 +83,23 @@ def main(cfg:Config):
     D_env = ReplayBuffer(obs_dim, action_dim, cfg.D_env_capacity)
     D_model = ReplayBuffer(obs_dim, action_dim, cfg.D_model_capacity)
 
+    step = 0
+    cumulative_reward = 0.0
+    if cfg.resume_id is not None:
+        resume_ckpt_path = os.path.join(cfg.save_dir, f"{cfg.env_name}-{cfg.resume_id}.pt")
+        checkpoint = torch.load(resume_ckpt_path, map_location=device, weights_only=False)
+        sac.load_state_dict(checkpoint["sac"])
+        wm.load_state_dict(checkpoint["wm"])
+
+    writer = SummaryWriter(log_dir=log_dir)
+
     print(f'{cfg.env_name = }')
     print(f"Initialized MBPO for {cfg.env_name} on {device}.")
     print(f"obs_dim={obs_dim}, action_dim={action_dim}")
+    print(f"Started new run {run_id}{f' from weights in {cfg.resume_id}' if cfg.resume_id is not None else ''}.")
 
     obs, info = env.reset()
-    step=0
-    cumulative_reward = 0.0
+
     while step < cfg.max_step:
 
         # # Step 1: wm rollout
@@ -94,7 +111,6 @@ def main(cfg:Config):
             with torch.no_grad():
                 action = sac.actor.get_action(fobs, sampling=True)
                 out, loss = wm(fobs, action)
-                assert loss is None
                 next_obs, reward = out[:, :-1], out[:, -1]
                 D_model.add_batch(fobs.cpu().numpy(), action.cpu().numpy(), reward.cpu().numpy(), next_obs.cpu().numpy(), np.zeros_like(reward.cpu().numpy()))
            
@@ -103,7 +119,8 @@ def main(cfg:Config):
         if step % cfg.wm_train_interval == 0 and D_env.can_sample(cfg.wm_train_batch_size):
             wm.train()
             # slice out obs, action, next_obs, reward
-            wm.update(*fuck(*(D_env.sample(cfg.wm_train_batch_size)[:4]),device=device))
+            wm_loss = wm.update(*fuck(*(D_env.sample(cfg.wm_train_batch_size)[:4]), device=device))
+            writer.add_scalar("train/wm_loss", wm_loss, step)
 
         # Step 3: env rollout
         sac.eval()
@@ -114,8 +131,10 @@ def main(cfg:Config):
         D_env.add(obs, action, reward, next_obs, terminated or truncated)
         if terminated or truncated:
             obs, info = env.reset()
-            r=eval_policy(eval_env, sac.actor, 10, device)
+            r = eval_policy(eval_env, sac.actor, 10, device)
             print(f"Step {step}; Reward: {r:.2f}; TrainReward:{cumulative_reward:.2f}")
+            writer.add_scalar("eval/return", r, step)
+            writer.add_scalar("train/episode_return", cumulative_reward, step)
             cumulative_reward = 0.0
         else:
             obs = next_obs
@@ -123,15 +142,23 @@ def main(cfg:Config):
         # Step 4: sac train
         sac.train()
         if D_model.can_sample(cfg.sac_batch_size):
-            loss_dict=sac.update(*fuck(*D_model.sample(cfg.sac_batch_size),device=device))
-            # if step%200==0:
-            #     print(step)
-            #     from pprint import pp
-            #     pp(loss_dict)
-            #     r=eval_policy(env, sac.actor, 10, device)
-            #     print(f"Step {step}, Reward: {r:.2f}")
+            sac_loss_dict = {}
+            for g in range(cfg.sac_gradient_step):
+                loss_dict = sac.update(*fuck(*D_model.sample(cfg.sac_batch_size), device=device))
+                for k, v in loss_dict.items():
+                    sac_loss_dict[k] = sac_loss_dict.get(k, 0) + v
+            for k, v in sac_loss_dict.items():
+                writer.add_scalar(f"train/{k}", v, step)
         
+        # Step 5: checkpoint save
+        if step % cfg.checkpoint_interval == 0:
+            torch.save(
+                {"sac": sac.state_dict(), "wm": wm.state_dict()},
+                os.path.join(cfg.save_dir, f"{cfg.env_name}-{run_id}.pt"),
+            )
+
+    writer.close()
 
 if __name__ == "__main__":
-    main(tyro.cli(Config))
-    # main(CONFIG[0])
+    # main(tyro.cli(Config))
+    main(CONFIG[0])
